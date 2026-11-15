@@ -1,0 +1,239 @@
+---
+title: "ADS506_Team8_FinalProject"
+format: html
+editor: visual
+---
+
+```{r}
+
+# Import Libraries
+
+library(tidyverse)
+library(tsibble)
+library(feasts)
+library(skimr)
+library(tseries)
+```
+
+```{r}
+
+# Import US energy consumption data from Github
+
+raw_url <- "https://raw.githubusercontent.com/JamesShoenhair/ADS506_Team8/main/release_us_subnational_generation_yearly.csv"
+
+gen_raw <- read_csv(raw_url, show_col_types = FALSE)
+
+head(gen_raw, 20)
+```
+
+```{r}
+
+# Cleaning & transformation
+
+# Cleaning variable columns
+
+gen <- gen_raw |>
+  rename(
+    area             = `Area`,
+    iso3             = `ISO 3 code`,
+    state            = `State`,
+    state_code       = `State code`,
+    year             = `Year`,
+    source           = `Electricity source`,
+    is_aggregate     = `Is aggregated source`,
+    gen_twh          = `Generation (TWh)`,
+    gen_yoy_twh      = `Generation YoY change (TWh)`,
+    gen_yoy_pct      = `Generation YoY change (%)`,
+    gen_share_pct    = `Share of generation (%)`,
+    gen_share_yoy_pp = `Share of generation YoY change (% points)`,
+    emis_mt          = `Emissions (MtCO2e)`,
+    emis_yoy_mt      = `Emissions YoY change (MtCO2e)`,
+    emis_yoy_pct     = `Emissions YoY change (%)`,
+    emis_share_pct   = `Share of emissions (%)`,
+    intensity_g_kwh  = `Emissions intensity (gCO2e/kWh)`
+  ) |>
+  select(-area, -iso3)
+```
+
+```{r}
+
+# View top 20 lines after column cleaning
+
+skim(gen)
+```
+
+```{r}
+
+# Rows like "Total generation", "Fossil", "Clean", "Renewables" are sums of other rows,
+# and "US (total)" is the sum of all states. Keep them apart to avoid double counting.
+
+gen_base   <- gen |> filter(!is_aggregate)
+gen_states <- gen |> filter(state != "US (total)")
+gen_us     <- gen |> filter(state == "US (total)")
+```
+
+```{r}
+
+# Data quality checks
+## Duplicates, missing values 
+
+# Duplicates
+gen |> count(state, source, year) |> filter(n > 1)
+```
+
+```{r}
+
+# Missing values per column
+gen |> summarise(across(everything(), ~ sum(is.na(.x))))
+```
+
+```{r}
+
+# Series with missing years
+gen |>
+  group_by(state, source) |>
+  summarise(first = min(year), last = max(year), n = n(), .groups = "drop") |>
+  filter(n < max(gen$year) - min(gen$year) + 1)
+```
+
+```{r}
+
+# Do individual sources add up to "Total generation"?
+gen_base |>
+  group_by(state, year) |>
+  summarise(sum_sources = sum(gen_twh), .groups = "drop") |>
+  left_join(gen |> filter(source == "Total generation") |> select(state, year, gen_twh),
+            by = c("state", "year")) |>
+  summarise(max_diff = max(abs(sum_sources - gen_twh)))
+```
+
+```{r}
+
+# Extreme YoY % values (usually caused by a near-zero previous year)
+gen |> slice_max(gen_yoy_pct, n = 10) |> select(state, year, source, gen_yoy_pct)
+```
+
+```{r}
+
+# Convert dataframe to tsiblle
+
+gen_ts <- gen |>
+  as_tsibble(key = c(state, source), index = year)
+
+has_gaps(gen_ts) |> filter(.gaps)
+```
+
+```{r}
+
+# Visualitations - national trends
+
+us_total <- gen_ts |> filter(state == "US (total)", source == "Total generation")
+us_total |> autoplot(gen_twh) + labs(title = "US generation (TWh)")
+```
+
+```{r}
+
+us_total |> autoplot(emis_mt) + labs(title = "US emissions (MtCO2e)")
+```
+
+```{r}
+
+us_total |> autoplot(intensity_g_kwh) + labs(title = "US emissions intensity (gCO2e/kWh)")
+```
+
+```{r}
+
+# US share of energy consumption by source - clean, renewable, fossil fuel
+# Includes gruping sources
+
+gen_us_grouped <- gen_us |>
+  filter(!is_aggregate) |>
+  mutate(source_group = case_when(
+    source %in% c("Coal", "Gas", "Other fossil")              ~ "Fossil fuels",
+    source == "Nuclear"                                       ~ "Nuclear",
+    source %in% c("Wind", "Solar", "Hydro",
+                  "Bioenergy", "Other renewables")            ~ "Renewables",
+    TRUE                                                      ~ NA_character_
+  )) |>
+  group_by(year, source_group) |>
+  summarise(
+    gen_twh       = sum(gen_twh, na.rm = TRUE),
+    gen_share_pct = sum(gen_share_pct, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Check: every source got a group (should return 0 rows)
+gen_us |> filter(!is_aggregate) |> distinct(source) |>
+  filter(!source %in% c("Coal", "Gas", "Other fossil", "Nuclear", "Wind",
+                        "Solar", "Hydro", "Bioenergy", "Other renewables"))
+
+gen_us_grouped |>
+  ggplot(aes(year, gen_share_pct, colour = source_group)) +
+  geom_line(linewidth = 1) +
+  labs(title = "US share of generation by source group (%)",
+       x = NULL, y = "Share of generation (%)", colour = NULL)
+```
+
+```{r}
+
+# Heatmap of grouped US data
+
+gen_us_grouped |>
+  ggplot(aes(year, source_group, fill = gen_share_pct)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = round(gen_share_pct, 0)), size = 3, colour = "white") +
+  scale_fill_viridis_c(name = "Share (%)") +
+  scale_x_continuous(breaks = seq(2001, 2025, 2), expand = c(0, 0)) +
+  labs(title = "US share of generation by source group (%)", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+```{r}
+
+# Check for correlations
+
+gen_base |>
+  select(gen_twh, gen_share_pct, emis_mt, intensity_g_kwh) |>
+  cor(use = "complete.obs")
+```
+
+```{r}
+
+# Choose target series
+
+get_series <- function(st = "US (total)", src = "Total generation") {
+  gen_ts |> filter(state == st, source == src)
+}
+
+y <- get_series()
+```
+
+```{r}
+
+# Identifying trend and stationarity
+
+# Yearly data has no seasonality, so focus on trend
+y |> gg_tsdisplay(gen_twh, plot_type = "partial", lag_max = 10)
+
+# Unit root tests on levels and first differences
+y |> features(gen_twh, list(unitroot_kpss, unitroot_ndiffs))
+y |> mutate(d_gen = difference(gen_twh)) |> features(d_gen, unitroot_kpss)
+
+adf.test(y$gen_twh)
+adf.test(na.omit(difference(y$gen_twh)))
+
+```
+
+```{r}
+
+# ACF & PACF values of differenced series
+
+y |> mutate(d_gen = difference(gen_twh)) |>
+  gg_tsdisplay(d_gen, plot_type = "partial", lag_max = 10)
+```
+
+```         
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
