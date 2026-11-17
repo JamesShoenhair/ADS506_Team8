@@ -1,0 +1,325 @@
+---
+title: "ADS-506 Team 8: Final Project"
+format: html
+editor: visual
+---
+
+```{r}
+
+# Import libraries
+
+library(tidyverse)
+library(tsibble)
+library(feasts)
+library(skimr)
+library(tseries)
+```
+
+## Data Loading and Initial Exploration
+
+```{r}
+
+# Import US energy consumption data from Github
+
+raw_url <- "release_us_subnational_generation_monthly.csv"
+
+gen_raw <- read_csv(raw_url, show_col_types = FALSE)
+
+head(gen_raw, 20)
+```
+
+```{r}
+
+# Cleaning & transformation
+
+# Cleaning variable columns
+
+gen <- gen_raw |>
+  rename(
+    area             = `Area`,
+    iso3             = `ISO 3 code`,
+    state            = `State`,
+    state_code       = `State code`,
+    date             = `Date`,
+    source           = `Electricity source`,
+    is_aggregate     = `Is aggregated source`,
+    gen_twh          = `Generation (TWh)`,
+    gen_yoy_twh      = `Generation YoY change (TWh)`,
+    gen_yoy_pct      = `Generation YoY change (%)`,
+    gen_share_pct    = `Share of generation (%)`,
+    gen_share_yoy_pp = `Share of generation YoY change (% points)`,
+    emis_mt          = `Emissions (MtCO2e)`,
+    emis_yoy_mt      = `Emissions YoY change (MtCO2e)`,
+    emis_yoy_pct     = `Emissions YoY change (%)`,
+    emis_share_pct   = `Share of emissions (%)`,
+    intensity_g_kwh  = `Emissions intensity (gCO2e/kWh)`
+  ) |>
+  mutate(month = yearmonth(date)) |>
+    select(-area, -iso3)
+```
+
+```{r}
+
+# View top 20 lines after column cleaning
+
+skim(gen)
+```
+
+```{r}
+
+# Rows like "Total generation", "Fossil", "Clean", "Renewables" are sums of other rows,
+# and "US (total)" is the sum of all states. Keep them apart to avoid double counting.
+
+# US monthly data 
+gen_us  <- gen |> filter(state == "US (total)")
+
+# Fossil and clean emissions
+us_emissions <- gen_us |>
+  filter(source %in% c("Fossil", "Clean")) |>
+  select(month, source, emis_mt) |>
+  arrange(source, month)
+```
+
+```{r}
+
+# Data quality checks
+## Duplicates, missing values 
+
+# Duplicates
+us_emissions |> count(source, month) |> filter(n > 1)
+```
+
+```{r}
+
+# Missing values per column
+gen |> summarise(across(everything(), ~ sum(is.na(.x))))
+```
+
+```{r}
+# Monthly tsibble
+emissions_ts <- us_emissions |>
+  as_tsibble(key = source, index = month)
+
+# Series with missing months (clean vs. fossil)
+has_gaps(emissions_ts)
+```
+
+```{r}
+
+# Do fossil + clean emissions add up to total US emissions?
+sumcheck <- us_emissions |>
+  group_by(month) |>
+  summarise(groupedtotal = sum(emis_mt),
+            .groups = "drop") |>
+  left_join(gen_us |>
+              filter(source == "Total generation") |>
+              select(month, actualtotal = emis_mt),
+    by = "month") |>
+  mutate(difference = groupedtotal - actualtotal)
+
+# Max. (absolute) difference between fossil + clean and actual total emissions
+sumcheck |> summarise(max_difference_mt = max(abs(difference)))
+```
+
+```{r}
+
+# Largest YoY % increases in monthly emissions
+gen_us |>
+  filter(source %in% c("Fossil", "Clean")) |>
+  slice_max(emis_yoy_pct, n = 10) |>
+  select(month, source, emis_mt, emis_yoy_pct)
+```
+
+```{r}
+
+# Visualizations
+
+# Fossil fuels - monthly emissions
+emissions_ts |>
+  filter(source == "Fossil") |>
+  autoplot(emis_mt) + labs(title = "Monthly US Emissions (MtCO2e): Fossil Fuels",
+                           subtitle = "January 2001 - August 2026",
+                           x = "Month",
+                           y = "Emissions (MtCO2e)")
+```
+
+```{r}
+
+# Clean energy - monthly emissions
+emissions_ts |>
+  filter(source == "Clean") |>
+  autoplot(emis_mt) + labs(title = "Monthly US Emissions (MtCO2e): Clean Energy",
+                           subtitle = "January 2001 - August 2026",
+                           x = "Month",
+                           y = "Emissions (MtCO2e)")
+```
+
+```{r}
+
+# Fossil fuels - monthly emissions intensity
+gen_us |>
+  filter(source == "Fossil") |>
+  as_tsibble(key = source, index = month) |>
+  autoplot(intensity_g_kwh) + labs(title = "Monthly US Emissions Intensity: Fossil Fuels",
+                                   subtitle = "January 2001 - August 2026",
+                                   x = "Month",
+                                   y = "Emissions intensity (gCO2e/kWh)")
+```
+
+```{r}
+
+# Clean energy - monthly emissions intensity
+gen_us |>
+  filter(source == "Clean") |>
+  as_tsibble(key = source, index = month) |>
+  autoplot(intensity_g_kwh) + labs(title = "Monthly US Emissions Intensity: Clean Energy",
+                                   subtitle = "January 2001 - August 2026",
+                                   x = "Month",
+                                   y = "Emissions intensity (gCO2e/kWh)")
+```
+
+```{r}
+
+# US share of energy consumption by source - clean, renewable, fossil fuel
+# Includes grouping sources
+
+gen_us_grouped <- gen_us |> 
+  filter(is_aggregate,
+         source %in% c("Fossil", "Clean")) |>
+  arrange(source, month)
+  
+
+gen_us_grouped |> as_tsibble(key = source, index = month) |>
+  autoplot(emis_share_pct) + labs(title = "US Share of Emissions by Source Group",
+                                  subtitle = "January 2001 - August 2026",
+                                  x = "Month",
+                                  y = "Share of total emissions (%)",
+                                  colour = "Source")
+```
+
+```{r}
+
+# Heatmap of grouped US data
+
+gen_us_grouped |>
+  ggplot(aes(x = as.Date(month), y = source, fill = emis_share_pct)) +
+  geom_tile(colour = "white", linewidth = 0.05) +
+  scale_fill_viridis_c(name = "Emissions share (%)") +
+  scale_x_date(date_breaks = "2 years",
+               date_labels = "%Y",
+               expand = c(0, 0)) +
+  labs(title = "Monthly US Share of Emissions by Source Group (%)", x = NULL, y = NULL) + 
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+```{r}
+
+# Check for correlations between fossil and clean
+
+correlations <- us_emissions |>
+  pivot_wider(names_from = source,
+              values_from = emis_mt)
+
+correlations |>
+  select(Fossil, Clean) |>
+  cor(use = "complete.obs")
+```
+
+```{r}
+
+# Choose target series (fossil and clean)
+
+fossil <- emissions_ts |> filter(source == "Fossil")
+
+clean <- emissions_ts |> filter(source == "Clean")
+```
+
+```{r}
+
+# STL decomposition - fossil fuels
+fossil |> model(STL(emis_mt)) |>
+  components() |>
+  autoplot()
+```
+
+```{r}
+
+# STL decomposition - clean energy
+clean |> model(STL(emis_mt)) |>
+  components() |>
+  autoplot()
+```
+
+```{r}
+
+# Identifying stationarity and recommended seasonal differencing
+
+# Unit root tests
+emissions_ts |>
+  features(emis_mt, list(unitroot_kpss, unitroot_nsdiffs))
+
+# Checking for recommended ordinary differencing, on the two seasonally differenced series
+emissions_ts |>
+  group_by(source) |>
+  mutate(seasonal_diff = difference(emis_mt, 12)) |>
+  ungroup() |>
+  filter(!is.na(seasonal_diff)) |>
+  features(seasonal_diff, unitroot_ndiffs)
+```
+
+```{r}
+
+# Differencing
+
+# Clean - seasonal difference + ordinary difference
+clean <- clean |>
+  mutate(emis_diff = difference(difference(emis_mt, lag = 12), lag = 1))
+
+# Fossil - only seasonal difference
+fossil <- fossil |>
+  mutate(emis_diff = difference(emis_mt, lag = 12))
+```
+
+```{r}
+
+# Re-checking stationarity
+clean |> filter(!is.na(emis_diff)) |> features(emis_diff, unitroot_kpss)
+fossil |> filter(!is.na(emis_diff)) |> features(emis_diff, unitroot_kpss)
+```
+
+```{r}
+
+# Differenced series, ACF & PACF values of differenced series
+
+clean |>
+  filter(!is.na(emis_diff)) |>
+  gg_tsdisplay(emis_diff, plot_type = "partial", lag_max = 36) +
+  labs(title = "Clean Energy Emissions - Post-Seasonal + Ordinary Differencing")
+
+fossil |>
+  filter(!is.na(emis_diff)) |>
+  gg_tsdisplay(emis_diff, plot_type = "partial", lag_max = 36) +
+  labs(title = "Fossil Fuel Emissions - Post-Seasonal Differencing")
+```
+
+```{r}
+
+# Exploring log transformations
+
+# Fossil fuel emissions - log scale plot
+fossil |>
+  autoplot(log(emis_mt)) +
+  labs(title = "Monthly US Fossil Fuel Emissions: Log Scale",
+       x = "Month",
+       y = "Log Emissions")
+
+# Clean energy emissions - log scale plot
+clean |>
+  autoplot(log(emis_mt)) +
+  labs(title = "Monthly US Clean Energy Emissions: Log Scale",
+       x = "Month",
+       y = "Log Emissions")
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
